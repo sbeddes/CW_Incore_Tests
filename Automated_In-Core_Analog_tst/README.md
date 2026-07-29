@@ -1,28 +1,48 @@
-# Automated In-Core Analog Test
+# Keyboard-Controlled In-Core Analog Test
 
-This directory contains a standalone Visual Studio 2010 project that combines the current-source behavior from `In-Core_Analog_tst` with the VTI Fgen channel control used by `DCOffset`.
+This directory contains a standalone Visual Studio 2010 project that combines the Martel current-source behavior from `In-Core_Analog_tst` with the VTI Fgen relay control used by `DCOffset`.
 
-## Test sequence
+## Operator controls
 
-For each of eight analog channels, the program:
+The program starts on analog channel 1 at 1 uA and keeps that state active until the operator presses a key.
 
-1. Places the Martel current calibrator in `STBY`.
-2. Disables all eight VTI Fgen outputs.
-3. Applies 24 V to the selected Fgen channel.
-4. The selected output energizes the jumpered HIGH and LOW relay coils for that analog channel.
-5. Applies 1, 2, 3, and 4 uA through the Martel calibrator.
-6. Holds each current for 30 seconds.
-7. Returns the Martel to `STBY` before releasing the relay pair.
-8. Moves to the next analog channel.
+- `RIGHT ARROW` moves to the next channel.
+- `LEFT ARROW` moves to the previous channel.
+- `UP ARROW` increases current by 1 uA.
+- `DOWN ARROW` decreases current by 1 uA.
+- `ESC` places the Martel in `STBY`, disables every relay output, returns the Martel to `LOCAL`, and exits.
+- `Ctrl+C` remains available as a backup safe shutdown.
 
-At normal completion, error, or Ctrl+C, the program commands `STBY`, disables all relay outputs, closes the Fgen session, returns the Martel to `LOCAL`, and closes the serial port.
+The settings roll over in both directions:
+
+- Channel 8 followed by `RIGHT ARROW` returns to channel 1.
+- Channel 1 followed by `LEFT ARROW` returns to channel 8.
+- 4 uA followed by `UP ARROW` returns to 1 uA.
+- 1 uA followed by `DOWN ARROW` returns to 4 uA.
+
+## Safety behavior
+
+The current is limited to 1-4 uA in two places. The keyboard logic only generates values inside that range, and the final output function rejects any value below 1 uA or above 4 uA before sending it to the Martel.
+
+Before a channel changes, the program:
+
+1. Places the Martel in `STBY`.
+2. Disables all eight Fgen outputs.
+3. Waits for the previous relay pair to release.
+4. Applies 24 V to the selected Fgen channel.
+5. Waits for the selected HIGH and LOW relay pair to settle.
+6. Restores the currently selected 1-4 uA output.
+
+Before a current changes, the program places the Martel in `STBY`, sends the new validated current command, and then sends `OPER`.
+
+At ESC, Ctrl+C, or any detected error, the program uses one common shutdown path: current is removed first, all relays are released second, the Fgen session is closed, and the Martel is returned to `LOCAL`.
 
 ## Included files
 
 - `Automated_In-Core_Analog_tst.sln` - Visual Studio 2010 solution
 - `Automated_In-Core_Analog_tst.vcxproj` - x64 C++ project
-- `Automated_In-Core_Analog_tst.cpp` - combined test program
-- `config.h` - IP address, COM port, relay voltage, channel count, and timing constants
+- `Automated_In-Core_Analog_tst.cpp` - keyboard-controlled test program
+- `config.h` - IP address, COM port, current limits, relay voltage, channel count, and timing constants
 
 No R*TIME, MMI database, `mmidata`, `ptsinuse`, or DMM dependencies are used.
 
@@ -43,8 +63,8 @@ These vendor DLLs are referenced through `#import`; they are not copied into the
 - Martel serial port: `COM6`
 - VTI resource: `TCPIP::10.107.42.49::INSTR`
 - Analog channels: 8
-- Current steps: 1-4 uA
-- Dwell time: 30 seconds per current
+- Current range: 1-4 uA
+- Initial state: channel 1 at 1 uA
 - Relay command voltage: 24 V
 - Fgen initialization options: empty string, matching the active initialization call in `DCOffset`
 
