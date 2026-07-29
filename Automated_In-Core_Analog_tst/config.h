@@ -1,25 +1,44 @@
 #pragma once
 
-// Martel 3001 current calibrator serial connection.
+// This file keeps the values that may need to change from one test setup to
+// another in one place. The main program should not need to be edited just
+// because the COM port, IP address, timing, or channel count changes.
+
+// The Martel 3001 is connected through a USB-to-serial adapter. Windows uses
+// the "\\.\COM#" format so the same code will still work if the assigned COM
+// number is greater than COM9.
 static const char* const CURRENT_CALIBRATOR_PORT = "\\\\.\\COM6";
 
-// VTI EX1268 chassis containing the Fgen card used by DCOffset.
+// This is the same EX1268 chassis address used by DCOffset. The chassis holds
+// the Fgen card that supplies the 24 V relay-control outputs.
 static const char* const FGEN_RESOURCE = "TCPIP::10.107.42.49::INSTR";
 
-// DCOffset currently initializes the Fgen driver with an empty options string.
-// Keep the same working behavior here. If the chassis ever requires explicit
-// slot selection, change this to: "DriverSetup= Slots= (8=Fgen)"
+// DCOffset currently initializes the Fgen driver with an empty options string,
+// so this program keeps that same behavior. This gives us the best chance of
+// selecting the same working card configuration without changing the chassis.
+// If the driver ever stops choosing the correct card automatically, use:
+// "DriverSetup= Slots= (8=Fgen)"
 static const char* const FGEN_DRIVER_OPTIONS = "";
 
+// There are eight analog channels. Each channel uses one Fgen output because
+// the HIGH and LOW relay coils for that channel are jumpered together.
 static const int NUMBER_OF_TEST_CHANNELS = 8;
+
+// The current loop includes both limits, so these values produce 1, 2, 3, and
+// 4 uA on every selected analog channel.
 static const int START_CURRENT_UA = 1;
 static const int END_CURRENT_UA = 4;
 
-// Each current level remains applied for 30 seconds before advancing.
+// The current remains active for 30 seconds before the program advances. This
+// leaves time for the existing external voltage reading to settle and be read.
 static const int CURRENT_DWELL_SECONDS = 30;
 
-// Each Fgen channel drives the jumpered HIGH and LOW relay coils for one
-// analog test channel.
+// The relay coils require 24 V. One Fgen channel energizes both the HIGH and
+// LOW relay coils for the selected analog channel at the same time.
 static const double RELAY_VOLTAGE = 24.0;
+
+// The release delay gives the previous relay pair time to open before another
+// channel is selected. The settle delay gives the new relay pair time to close
+// before the Martel current output is enabled.
 static const int RELAY_RELEASE_DELAY_MS = 500;
 static const int RELAY_SETTLE_DELAY_MS = 500;
