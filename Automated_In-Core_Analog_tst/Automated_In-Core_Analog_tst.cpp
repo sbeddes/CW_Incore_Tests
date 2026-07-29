@@ -1,9 +1,9 @@
 // Automated_In-Core_Analog_tst.cpp
 //
 // Purpose:
-// This program automates the existing in-core analog current test across all
-// eight analog channels. The Martel 3001 supplies the 1-4 uA test current, and
-// the VTI Fgen card supplies 24 V to the relay pair for the selected channel.
+// This program gives the operator direct keyboard control of the in-core analog
+// test. The Martel 3001 supplies the test current, and the VTI Fgen card supplies
+// 24 V to the relay pair for the selected analog channel.
 //
 // Relay setup:
 // Each analog channel has one HIGH relay and one LOW/ground relay. The two relay
@@ -11,21 +11,23 @@
 // relays at the same time. Fgen CH1 selects analog channel 1, CH2 selects analog
 // channel 2, and this continues through CH8.
 //
-// Test sequence:
-// 1. Place the Martel in STBY so its current output is inactive.
-// 2. Turn off all Fgen relay outputs.
-// 3. Apply 24 V to the relay pair for the channel being tested.
-// 4. Step the Martel through 1, 2, 3, and 4 uA.
-// 5. Hold each current for 30 seconds so the voltage can be read externally.
-// 6. Return the Martel to STBY before opening the relays or changing channels.
+// Keyboard controls:
+// RIGHT ARROW - move to the next analog channel
+// LEFT ARROW  - move to the previous analog channel
+// UP ARROW    - increase the current by 1 uA
+// DOWN ARROW  - decrease the current by 1 uA
+// ESC         - shut down both instruments and exit
 //
-// The shutdown path follows the same safe order whether the test finishes,
-// encounters an error, or is stopped with Ctrl+C.
+// Both settings roll over. Channel 8 rolls back to channel 1, channel 1 rolls
+// back to channel 8, 4 uA rolls back to 1 uA, and 1 uA rolls back to 4 uA.
+// The current command is also checked immediately before it is sent so a future
+// code change cannot command the Martel below 1 uA or above 4 uA.
 //
 // Visual Studio 2010 compatible.
 
 #include <Windows.h>
 #include <signal.h>
+#include <conio.h>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -38,31 +40,36 @@
 #import "IviSessionFactory.dll" no_namespace
 #import "VTEXFgen_64.dll" no_namespace
 
-// The hardware addresses, current range, relay voltage, and timing values are
-// kept in config.h so they can be changed without rewriting the test sequence.
 #include "config.h"
 
-// The Ctrl+C handler only sets this flag. The normal program flow notices the
-// flag and performs the full shutdown instead of trying to control hardware
-// directly from inside the signal handler.
+// Ctrl+C remains available as a backup stop. The signal handler only sets a flag
+// because hardware commands should not be sent from inside a signal handler.
 volatile sig_atomic_t gStopRequested = 0;
 
-// The Martel serial handle is global because the send, read, standby, and
-// shutdown functions all need to use the same open connection.
+// The Martel serial handle is global because the serial and shutdown functions
+// all use the same open connection.
 HANDLE gSerialPort = INVALID_HANDLE_VALUE;
 
-// Ctrl+C requests a safe stop. The current wait or loop ends, then shutdownSystem
-// places the Martel in STBY and turns off every relay output.
+// Windows returns a two-byte sequence for an arrow key. The first byte is 0 or
+// 224 and the second byte identifies which arrow was pressed.
+enum KeyAction
+{
+    KEY_ACTION_NONE,
+    KEY_ACTION_LEFT,
+    KEY_ACTION_RIGHT,
+    KEY_ACTION_UP,
+    KEY_ACTION_DOWN,
+    KEY_ACTION_ESCAPE,
+    KEY_ACTION_STOP_REQUESTED
+};
+
 void handleCtrlC(int)
 {
     gStopRequested = 1;
 }
 
-// Send one command to the Martel calibrator.
-//
-// The Martel expects a carriage return at the end of every command, so it is
-// added here instead of requiring every caller to remember it. The function
-// returns true only when Windows reports that the entire command was written.
+// Send one command to the Martel. A carriage return is added here so every
+// command is terminated the same way.
 bool sendCalibratorCommand(const std::string& command)
 {
     if (gSerialPort == INVALID_HANDLE_VALUE)
@@ -84,9 +91,8 @@ bool sendCalibratorCommand(const std::string& command)
     return bytesWritten == static_cast<DWORD>(message.size());
 }
 
-// Read one response from the Martel until a carriage return is received or the
-// allowed time expires. Reading one character at a time keeps the response
-// handling simple and matches the short text replies sent by the calibrator.
+// Read one Martel response until a carriage return is received or the timeout
+// expires. The response is only used during the startup identity check.
 std::string readCalibratorResponse(DWORD timeoutMs)
 {
     std::string response;
@@ -108,16 +114,12 @@ std::string readCalibratorResponse(DWORD timeoutMs)
             return "READ ERROR";
         }
 
-        // A read can return without providing a character because of the serial
-        // timeout settings. Wait briefly and continue until the full timeout.
         if (bytesRead == 0)
         {
             Sleep(10);
             continue;
         }
 
-        // The Martel terminates its response with a carriage return. Line feeds
-        // are ignored so they do not become part of the returned identity text.
         if (character == '\r')
             break;
 
@@ -128,9 +130,8 @@ std::string readCalibratorResponse(DWORD timeoutMs)
     return response;
 }
 
-// Wait for a requested number of milliseconds while checking for Ctrl+C every
-// 100 ms. A single long Sleep would make the program appear unresponsive during
-// each 30-second current dwell.
+// Relay delays stay interruptible so Ctrl+C can stop the program even while a
+// relay is releasing or settling.
 bool waitWithAbort(int milliseconds)
 {
     int elapsed = 0;
@@ -141,7 +142,7 @@ bool waitWithAbort(int milliseconds)
             return false;
 
         const int remaining = milliseconds - elapsed;
-        const int step = remaining < 100 ? remaining : 100;
+        const int step = remaining < 50 ? remaining : 50;
         Sleep(step);
         elapsed += step;
     }
@@ -149,15 +150,9 @@ bool waitWithAbort(int milliseconds)
     return true;
 }
 
-// Convenience wrapper used when a delay is easier to define in seconds.
-bool waitSeconds(int seconds)
-{
-    return waitWithAbort(seconds * 1000);
-}
-
-// Configure the serial settings used by the Martel 3001. These values preserve
-// the settings from the original In-Core_Analog_tst program: 9600 baud, 8 data
-// bits, no parity, one stop bit, and XON/XOFF software flow control.
+// Configure the Martel serial connection using the same settings as the original
+// in-core analog test: 9600 baud, 8 data bits, no parity, one stop bit, and
+// XON/XOFF software flow control.
 bool configureSerialPort()
 {
     DCB settings;
@@ -166,8 +161,6 @@ bool configureSerialPort()
     ZeroMemory(&settings, sizeof(settings));
     settings.DCBlength = sizeof(settings);
 
-    // Start with the current Windows port settings so fields that are not being
-    // changed here keep valid values.
     if (!GetCommState(gSerialPort, &settings))
         return false;
 
@@ -185,9 +178,6 @@ bool configureSerialPort()
     if (!SetCommState(gSerialPort, &settings))
         return false;
 
-    // Keep individual reads short because readCalibratorResponse controls the
-    // overall response timeout itself. The longer write timeout allows Windows
-    // time to transmit the complete command through the USB serial adapter.
     ZeroMemory(&timeouts, sizeof(timeouts));
     timeouts.ReadIntervalTimeout = 50;
     timeouts.ReadTotalTimeoutConstant = 100;
@@ -196,9 +186,8 @@ bool configureSerialPort()
     return SetCommTimeouts(gSerialPort, &timeouts) != 0;
 }
 
-// Open and verify the Martel current calibrator before any relay is energized.
-// The connection is opened for both reading and writing because the program
-// sends commands and reads the reply to *IDN?.
+// Open and verify the Martel before any relay is energized. Startup ends with
+// the Martel in REMOTE and STBY so the first channel can be selected safely.
 bool openCurrentCalibrator()
 {
     gSerialPort = CreateFileA(
@@ -226,11 +215,9 @@ bool openCurrentCalibrator()
         return false;
     }
 
-    // Clear any old characters left in the USB serial buffers. This prevents a
-    // response from a previous run from being mistaken for the new *IDN? reply.
+    // Clear any characters left in the serial buffers from a previous run.
     PurgeComm(gSerialPort, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
-    // Confirm that a device is responding before the test is allowed to continue.
     if (!sendCalibratorCommand("*IDN?"))
     {
         std::cerr << "Failed to send *IDN? to current calibrator."
@@ -249,15 +236,11 @@ bool openCurrentCalibrator()
 
     std::cout << "Current calibrator: " << response << std::endl;
 
-    // REMOTE allows the program to control the Martel through the serial port.
     if (!sendCalibratorCommand("REMOTE"))
         return false;
 
     Sleep(200);
 
-    // STBY removes the active current output before the Fgen selects a channel.
-    // It is treated as a high-impedance state for relay switching, but the relay
-    // contacts are still used when channel-to-channel isolation is required.
     if (!sendCalibratorCommand("STBY"))
         return false;
 
@@ -265,8 +248,7 @@ bool openCurrentCalibrator()
     return true;
 }
 
-// Convert an integer Fgen channel number into the channel name required by the
-// VTI driver. For example, channel 1 becomes "CH1" and channel 8 becomes "CH8".
+// Convert an integer channel number into the name expected by the VTI driver.
 std::string fgenChannelName(int channelNumber)
 {
     std::ostringstream stream;
@@ -274,9 +256,6 @@ std::string fgenChannelName(int channelNumber)
     return stream.str();
 }
 
-// Print the operation that failed and the COM error code returned by the VTI
-// driver. The error code is kept in hexadecimal because that is the most useful
-// format when comparing it to IVI/VTI driver documentation.
 void printComError(const char* operation, const _com_error& error)
 {
     std::cerr << operation << " failed. HRESULT=0x"
@@ -284,8 +263,8 @@ void printComError(const char* operation, const _com_error& error)
               << std::dec << std::endl;
 }
 
-// Turn off one Fgen relay-control output. The channel is disabled first, then
-// its stored DC offset is returned to zero so it is safe for the next selection.
+// Disable one relay-control output. The output is disabled before its stored
+// offset is reset to zero.
 bool disableRelayOutput(IVTEXFgenPtr fgen, int channelNumber)
 {
     try
@@ -304,9 +283,8 @@ bool disableRelayOutput(IVTEXFgenPtr fgen, int channelNumber)
     }
 }
 
-// Make a best effort to disable every relay channel. The loop continues even
-// if one output reports an error so the program still attempts to shut down the
-// other seven outputs. The return value records whether every channel succeeded.
+// Make a best effort to turn off all eight relay outputs. The loop continues if
+// one channel reports an error so the program still attempts to release the rest.
 bool allRelaysOff(IVTEXFgenPtr fgen)
 {
     bool success = true;
@@ -323,9 +301,8 @@ bool allRelaysOff(IVTEXFgenPtr fgen)
     return success;
 }
 
-// Configure all eight Fgen outputs once at startup. The outputs are set for DC
-// voltage operation but remain disabled and at zero volts until a test channel
-// is selected. This prevents a relay from energizing during initialization.
+// Configure all Fgen outputs for DC voltage operation. They remain disabled and
+// at zero volts until a channel is selected.
 bool configureRelayOutputs(IVTEXFgenPtr fgen)
 {
     try
@@ -337,10 +314,7 @@ bool configureRelayOutputs(IVTEXFgenPtr fgen)
             const std::string name = fgenChannelName(channelNumber);
             _bstr_t channel(name.c_str());
 
-            // Disable the output before changing any of its operating settings.
             fgen->Output->Enabled[channel] = VARIANT_FALSE;
-
-            // The relay circuit needs a DC voltage, not a generated AC waveform.
             fgen->Output->DriveMode[channel] = VTEXFgenDriveModeVoltage;
             fgen->Output->Range[channel] = RELAY_VOLTAGE;
             fgen->Output->ChannelOutputMode[channel] =
@@ -356,13 +330,10 @@ bool configureRelayOutputs(IVTEXFgenPtr fgen)
         return false;
     }
 
-    // End initialization by explicitly commanding every relay output off.
     return allRelaysOff(fgen);
 }
 
-// Connect to the VTI chassis and create the Fgen driver session. The two TRUE
-// values request an identity query and a device reset so the session starts from
-// a known condition before the relay outputs are configured.
+// Connect to the VTI chassis and prepare the Fgen card used for relay control.
 bool initializeRelayFgen(IVTEXFgenPtr& fgen)
 {
     try
@@ -375,8 +346,6 @@ bool initializeRelayFgen(IVTEXFgenPtr& fgen)
             VARIANT_TRUE,
             FGEN_DRIVER_OPTIONS);
 
-        // Save the generic IVI driver as the Fgen-specific pointer used by the
-        // remaining relay-control functions.
         fgen = driver;
 
         if (!configureRelayOutputs(fgen))
@@ -393,16 +362,18 @@ bool initializeRelayFgen(IVTEXFgenPtr& fgen)
     }
 }
 
-// Select one analog channel by applying 24 V to its Fgen output. Since the HIGH
-// and LOW relay coils are jumpered, enabling one Fgen channel closes both sides
-// of the analog path at the same time.
+// Select one analog channel using break-before-make switching. All relay outputs
+// are removed first, the old pair is allowed to release, and only then is 24 V
+// applied to the requested channel's jumpered HIGH and LOW relay coils.
 bool selectRelayChannel(IVTEXFgenPtr fgen, int channelNumber)
 {
     if (channelNumber < 1 || channelNumber > NUMBER_OF_TEST_CHANNELS)
+    {
+        std::cerr << "Refusing invalid relay channel " << channelNumber
+                  << "." << std::endl;
         return false;
+    }
 
-    // Use break-before-make switching. Every existing relay command is removed
-    // and given time to release before the next channel receives 24 V.
     if (!allRelaysOff(fgen))
         return false;
 
@@ -414,25 +385,21 @@ bool selectRelayChannel(IVTEXFgenPtr fgen, int channelNumber)
         const std::string name = fgenChannelName(channelNumber);
         _bstr_t channel(name.c_str());
 
-        // Set the requested relay voltage before enabling the physical output.
         fgen->StandardWaveform->DCOffset[channel] = RELAY_VOLTAGE;
         fgen->Output->Enabled[channel] = VARIANT_TRUE;
     }
     catch (const _com_error& error)
     {
         printComError("Select relay channel", error);
-
-        // If channel selection fails, remove every relay command before returning.
         allRelaysOff(fgen);
         return false;
     }
 
-    // Wait for both relays to close and settle before current is applied.
     return waitWithAbort(RELAY_SETTLE_DELAY_MS);
 }
 
-// Build the Martel command used to set each current value. This uses a stream
-// instead of std::to_string because the project must compile in Visual Studio 2010.
+// Build the Martel command without std::to_string so the project remains
+// compatible with Visual Studio 2010.
 std::string currentCommand(int microamps)
 {
     std::ostringstream stream;
@@ -440,8 +407,9 @@ std::string currentCommand(int microamps)
     return stream.str();
 }
 
-// Command the Martel to STBY and allow a short time for its output to become
-// inactive. This function is called before every relay change and during shutdown.
+// STBY removes the active current before a current value or relay channel is
+// changed. We do this even when changing from one allowed current to another so
+// a failed command cannot leave the old current active during a partial update.
 bool placeCurrentCalibratorInStandby()
 {
     if (gSerialPort == INVALID_HANDLE_VALUE)
@@ -452,19 +420,161 @@ bool placeCurrentCalibratorInStandby()
     return success;
 }
 
-// Return both pieces of test equipment to a safe state. The order is important:
-// remove the test current first, release the relays second, then close the hardware
-// sessions. This prevents the current source from remaining active while contacts
-// are opening or while the program is exiting.
+// This is the final current safety gate. Keyboard rollover should only produce
+// values from 1 through 4 uA, but this check prevents any out-of-range value from
+// reaching the calibrator even if the calling code is changed later.
+bool enableCurrentOutput(int microamps)
+{
+    if (microamps < MIN_CURRENT_UA || microamps > MAX_CURRENT_UA)
+    {
+        std::cerr << "Refusing unsafe current command: " << microamps
+                  << " uA. Allowed range is " << MIN_CURRENT_UA
+                  << "-" << MAX_CURRENT_UA << " uA." << std::endl;
+        return false;
+    }
+
+    if (!sendCalibratorCommand(currentCommand(microamps)))
+    {
+        std::cerr << "Failed to set current to " << microamps
+                  << " uA." << std::endl;
+        return false;
+    }
+
+    if (!sendCalibratorCommand("OPER"))
+    {
+        std::cerr << "Failed to enable current output." << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// Change the current in a controlled order: STBY, set the new allowed value,
+// then OPER. The output is never intentionally active while the value changes.
+bool changeCurrentOutput(int microamps)
+{
+    if (!placeCurrentCalibratorInStandby())
+    {
+        std::cerr << "Failed to place current calibrator in standby."
+                  << std::endl;
+        return false;
+    }
+
+    return enableCurrentOutput(microamps);
+}
+
+// Change channels in the same safe order we discussed. Current is removed first,
+// the old relay pair is released, the new pair is selected, and then the current
+// is restored at the operator's existing setting.
+bool changeSelectedChannel(
+    IVTEXFgenPtr fgen,
+    int newChannel,
+    int currentMicroamps)
+{
+    if (!placeCurrentCalibratorInStandby())
+    {
+        std::cerr << "Failed to place current calibrator in standby."
+                  << std::endl;
+        return false;
+    }
+
+    if (!selectRelayChannel(fgen, newChannel))
+        return false;
+
+    if (!enableCurrentOutput(currentMicroamps))
+    {
+        // If current cannot be restored, release the newly selected relays before
+        // returning the failure to the main loop.
+        allRelaysOff(fgen);
+        return false;
+    }
+
+    return true;
+}
+
+// Move one step up and wrap from the maximum back to the minimum.
+int incrementWithRollover(int value, int minimum, int maximum)
+{
+    return value >= maximum ? minimum : value + 1;
+}
+
+// Move one step down and wrap from the minimum back to the maximum.
+int decrementWithRollover(int value, int minimum, int maximum)
+{
+    return value <= minimum ? maximum : value - 1;
+}
+
+// Polling instead of blocking forever in _getch allows the Ctrl+C flag to be
+// noticed even while the operator is not pressing keys.
+KeyAction readKeyAction()
+{
+    while (!gStopRequested)
+    {
+        if (!_kbhit())
+        {
+            Sleep(KEYBOARD_POLL_DELAY_MS);
+            continue;
+        }
+
+        const int firstByte = _getch();
+
+        if (firstByte == 27)
+            return KEY_ACTION_ESCAPE;
+
+        if (firstByte == 0 || firstByte == 224)
+        {
+            const int secondByte = _getch();
+
+            switch (secondByte)
+            {
+                case 75:
+                    return KEY_ACTION_LEFT;
+                case 77:
+                    return KEY_ACTION_RIGHT;
+                case 72:
+                    return KEY_ACTION_UP;
+                case 80:
+                    return KEY_ACTION_DOWN;
+                default:
+                    return KEY_ACTION_NONE;
+            }
+        }
+
+        // All other keys are ignored. This prevents an accidental letter or
+        // number key from changing the hardware state.
+        return KEY_ACTION_NONE;
+    }
+
+    return KEY_ACTION_STOP_REQUESTED;
+}
+
+void printControls()
+{
+    std::cout << std::endl
+              << "Keyboard controls:" << std::endl
+              << "  LEFT / RIGHT : previous or next channel" << std::endl
+              << "  UP / DOWN    : increase or decrease current" << std::endl
+              << "  ESC          : safe shutdown and exit" << std::endl
+              << "  Ctrl+C       : backup safe shutdown" << std::endl
+              << std::endl;
+}
+
+void printCurrentState(int channel, int microamps)
+{
+    std::cout << "Active state -> Channel " << channel
+              << " | Current " << microamps << " uA"
+              << std::endl;
+}
+
+// Return both instruments to a safe state. Current is removed first, the relays
+// are released second, and only then are the hardware sessions closed.
 void shutdownSystem(IVTEXFgenPtr fgen)
 {
-    // Remove the test current before releasing any relay contacts.
     if (gSerialPort != INVALID_HANDLE_VALUE)
         placeCurrentCalibratorInStandby();
 
     if (fgen != NULL)
     {
-        // Try every channel even if one output reports an error.
         allRelaysOff(fgen);
         Sleep(200);
 
@@ -480,8 +590,6 @@ void shutdownSystem(IVTEXFgenPtr fgen)
 
     if (gSerialPort != INVALID_HANDLE_VALUE)
     {
-        // LOCAL returns front-panel control to the operator before the Windows
-        // serial handle is closed.
         sendCalibratorCommand("LOCAL");
         Sleep(200);
         CloseHandle(gSerialPort);
@@ -491,12 +599,8 @@ void shutdownSystem(IVTEXFgenPtr fgen)
 
 int main()
 {
-    // Register Ctrl+C before opening either device so an operator stop uses the
-    // same controlled shutdown path as the rest of the program.
     signal(SIGINT, handleCtrlC);
 
-    // The VTI driver is a COM component, so COM must be initialized before the
-    // Fgen object is created.
     HRESULT comResult = CoInitialize(NULL);
     if (FAILED(comResult))
     {
@@ -506,9 +610,10 @@ int main()
 
     IVTEXFgenPtr relayFgen;
     bool testFailed = false;
+    bool escapePressed = false;
+    int selectedChannel = INITIAL_TEST_CHANNEL;
+    int selectedCurrentUa = INITIAL_CURRENT_UA;
 
-    // Verify the current calibrator first. No relay is energized unless the
-    // Martel connection is open, identified, in REMOTE, and in STBY.
     if (!openCurrentCalibrator())
     {
         shutdownSystem(relayFgen);
@@ -516,7 +621,6 @@ int main()
         return 1;
     }
 
-    // Connect to the VTI chassis and prepare all eight relay-control outputs.
     if (!initializeRelayFgen(relayFgen))
     {
         shutdownSystem(relayFgen);
@@ -525,106 +629,115 @@ int main()
     }
 
     std::cout << std::endl
-              << "Automated in-core analog test starting." << std::endl
-              << "Eight channels, 1-4 uA, 30 seconds per current."
-              << std::endl
-              << "Press Ctrl+C to stop safely." << std::endl;
+              << "Keyboard-controlled in-core analog test starting."
+              << std::endl;
+    printControls();
 
-    // Test one complete analog channel at a time. A channel remains selected
-    // while all four current values are applied, then both relays are opened
-    // before the program advances to the next channel.
-    for (int testChannel = 1;
-         testChannel <= NUMBER_OF_TEST_CHANNELS && !gStopRequested;
-         ++testChannel)
+    // Start in the safest, most predictable state: channel 1 at 1 uA. The same
+    // channel-change function used by the arrow keys is used here so startup and
+    // later switching follow exactly the same relay and current sequence.
+    if (!changeSelectedChannel(
+            relayFgen,
+            selectedChannel,
+            selectedCurrentUa))
     {
-        std::cout << std::endl
-                  << "Selecting analog channel " << testChannel
-                  << " relay pair." << std::endl;
-
-        // The Martel must be in STBY before any relay output is changed. This
-        // removes the active current while the old contacts open and the new
-        // HIGH/LOW relay pair closes.
-        if (!placeCurrentCalibratorInStandby())
-        {
-            std::cerr << "Failed to place current calibrator in standby."
-                      << std::endl;
-            testFailed = true;
-            break;
-        }
-
-        if (!selectRelayChannel(relayFgen, testChannel))
-        {
-            // A Ctrl+C stop is expected and does not need to be reported as a
-            // hardware failure. Any other selection failure ends the test.
-            if (!gStopRequested)
-            {
-                std::cerr << "Failed to select relay channel "
-                          << testChannel << "." << std::endl;
-                testFailed = true;
-            }
-            break;
-        }
-
-        // Apply 1, 2, 3, and 4 uA while the selected channel's HIGH and LOW
-        // relays remain energized.
-        for (int microamps = START_CURRENT_UA;
-             microamps <= END_CURRENT_UA && !gStopRequested;
-             ++microamps)
-        {
-            const std::string command = currentCommand(microamps);
-
-            // OUT selects the requested current value but does not place the
-            // Martel output into operation by itself.
-            if (!sendCalibratorCommand(command))
-            {
-                std::cerr << "Failed to set current to " << microamps
-                          << " uA." << std::endl;
-                testFailed = true;
-                break;
-            }
-
-            // OPER connects and enables the current output at the value selected
-            // by the OUT command above.
-            if (!sendCalibratorCommand("OPER"))
-            {
-                std::cerr << "Failed to enable current output."
-                          << std::endl;
-                testFailed = true;
-                break;
-            }
-
-            std::cout << "Channel " << testChannel
-                      << ": " << microamps
-                      << " uA applied for "
-                      << CURRENT_DWELL_SECONDS
-                      << " seconds." << std::endl;
-
-            // The external voltage-reading process occurs during this 30-second
-            // window. Automated voltage acquisition can be added at this point
-            // later without changing the channel and current sequencing.
-            if (!waitSeconds(CURRENT_DWELL_SECONDS))
-                break;
-        }
-
-        // Open the Martel output before releasing this channel's relay pair.
-        // This same order is used whether all four currents completed, an error
-        // occurred, or the operator pressed Ctrl+C during the dwell.
-        placeCurrentCalibratorInStandby();
-        allRelaysOff(relayFgen);
-        waitWithAbort(RELAY_RELEASE_DELAY_MS);
-
-        if (testFailed)
-            break;
+        std::cerr << "Failed to establish the initial test state."
+                  << std::endl;
+        testFailed = true;
+    }
+    else
+    {
+        printCurrentState(selectedChannel, selectedCurrentUa);
     }
 
-    // Always use the common shutdown routine so normal completion and failure
-    // leave the equipment in the same known state.
+    while (!testFailed && !escapePressed && !gStopRequested)
+    {
+        const KeyAction action = readKeyAction();
+
+        if (action == KEY_ACTION_ESCAPE)
+        {
+            escapePressed = true;
+            break;
+        }
+
+        if (action == KEY_ACTION_STOP_REQUESTED)
+            break;
+
+        if (action == KEY_ACTION_RIGHT || action == KEY_ACTION_LEFT)
+        {
+            int requestedChannel = selectedChannel;
+
+            if (action == KEY_ACTION_RIGHT)
+            {
+                requestedChannel = incrementWithRollover(
+                    selectedChannel,
+                    1,
+                    NUMBER_OF_TEST_CHANNELS);
+            }
+            else
+            {
+                requestedChannel = decrementWithRollover(
+                    selectedChannel,
+                    1,
+                    NUMBER_OF_TEST_CHANNELS);
+            }
+
+            if (!changeSelectedChannel(
+                    relayFgen,
+                    requestedChannel,
+                    selectedCurrentUa))
+            {
+                std::cerr << "Failed to switch to channel "
+                          << requestedChannel << "." << std::endl;
+                testFailed = true;
+                break;
+            }
+
+            selectedChannel = requestedChannel;
+            printCurrentState(selectedChannel, selectedCurrentUa);
+            continue;
+        }
+
+        if (action == KEY_ACTION_UP || action == KEY_ACTION_DOWN)
+        {
+            int requestedCurrent = selectedCurrentUa;
+
+            if (action == KEY_ACTION_UP)
+            {
+                requestedCurrent = incrementWithRollover(
+                    selectedCurrentUa,
+                    MIN_CURRENT_UA,
+                    MAX_CURRENT_UA);
+            }
+            else
+            {
+                requestedCurrent = decrementWithRollover(
+                    selectedCurrentUa,
+                    MIN_CURRENT_UA,
+                    MAX_CURRENT_UA);
+            }
+
+            if (!changeCurrentOutput(requestedCurrent))
+            {
+                std::cerr << "Failed to change current to "
+                          << requestedCurrent << " uA." << std::endl;
+                testFailed = true;
+                break;
+            }
+
+            selectedCurrentUa = requestedCurrent;
+            printCurrentState(selectedChannel, selectedCurrentUa);
+        }
+    }
+
+    // ESC, Ctrl+C, normal failure, and startup failure all use this one shutdown
+    // path so there is no exit that intentionally leaves current or relay power on.
     shutdownSystem(relayFgen);
     CoUninitialize();
 
     if (gStopRequested)
     {
-        std::cout << "Test stopped by operator. Outputs were shut down."
+        std::cout << "Test stopped with Ctrl+C. Outputs were shut down."
                   << std::endl;
         return 2;
     }
@@ -636,7 +749,7 @@ int main()
         return 1;
     }
 
-    std::cout << "Test complete. All relay outputs are off and the Martel is local."
+    std::cout << "ESC pressed. All relay outputs are off and the Martel is local."
               << std::endl;
     return 0;
 }
