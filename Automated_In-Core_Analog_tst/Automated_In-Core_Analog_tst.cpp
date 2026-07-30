@@ -2,8 +2,8 @@
 //
 // Purpose:
 // This program gives the operator direct keyboard control of the in-core analog
-// test. The Martel 3001 supplies the test current, and the VTI Fgen card supplies
-// 24 V to the relay pair for the selected analog channel.
+// test. The Martel 3001 supplies the test current, and the VTI Fgen card controls
+// the relay pair for the selected analog channel.
 //
 // Relay setup:
 // Each analog channel has one HIGH relay and one LOW/ground relay. The two relay
@@ -23,22 +23,31 @@
 // The current command is also checked immediately before it is sent so a future
 // code change cannot command the Martel below 1 uA or above 4 uA.
 //
+// The Fgen setup and channel output sequence intentionally follow DCOffset. We
+// only use DCOffset's working Fgen behavior; none of its MMI or DMM logic is used.
+//
 // Visual Studio 2010 compatible.
 
 #include <Windows.h>
 #include <signal.h>
 #include <conio.h>
+#include <stdio.h>
+#include <math.h>
 #include <iostream>
 #include <iomanip>
 #include <string>
 #include <sstream>
 #include <comdef.h>
 
-// These are the same IVI and VTI COM libraries used by DCOffset. The DLLs must
-// already be installed and registered on the Windows test computer.
+// These are the same IVI and VTI COM libraries used by DCOffset. The 32-bit
+// project uses the 32-bit Fgen type library, while x64 uses the 64-bit library.
 #import "IviDriverTypeLib.dll" no_namespace
 #import "IviSessionFactory.dll" no_namespace
+#ifdef _WIN64
 #import "VTEXFgen_64.dll" no_namespace
+#else
+#import "VTEXFgen.dll" no_namespace
+#endif
 
 #include "config.h"
 
@@ -249,6 +258,7 @@ bool openCurrentCalibrator()
 }
 
 // Convert an integer channel number into the name expected by the VTI driver.
+// This is the same CH1 through CH8 naming used by DCOffset.
 std::string fgenChannelName(int channelNumber)
 {
     std::ostringstream stream;
@@ -256,15 +266,28 @@ std::string fgenChannelName(int channelNumber)
     return stream.str();
 }
 
+// Print both the HRESULT and any description supplied by the VTI driver. The
+// description is normally more useful than the Windows meaning of the raw code.
 void printComError(const char* operation, const _com_error& error)
 {
     std::cerr << operation << " failed. HRESULT=0x"
               << std::hex << static_cast<unsigned long>(error.Error())
               << std::dec << std::endl;
+
+    std::cerr << "Error message: " << error.ErrorMessage() << std::endl;
+
+    _bstr_t description = error.Description();
+    if (description.length() > 0)
+    {
+        std::wcerr << L"Driver description: "
+                   << static_cast<const wchar_t*>(description)
+                   << std::endl;
+    }
 }
 
-// Disable one relay-control output. The output is disabled before its stored
-// offset is reset to zero.
+// Turn off one relay-control output. DCOffset controls the physical state with
+// the Enabled property, so this function does the same thing. We do not rewrite
+// the waveform or DC offset while shutting a relay off.
 bool disableRelayOutput(IVTEXFgenPtr fgen, int channelNumber)
 {
     try
@@ -273,7 +296,6 @@ bool disableRelayOutput(IVTEXFgenPtr fgen, int channelNumber)
         _bstr_t channel(name.c_str());
 
         fgen->Output->Enabled[channel] = VARIANT_FALSE;
-        fgen->StandardWaveform->DCOffset[channel] = 0.0;
         return true;
     }
     catch (const _com_error& error)
@@ -301,8 +323,9 @@ bool allRelaysOff(IVTEXFgenPtr fgen)
     return success;
 }
 
-// Configure all Fgen outputs for DC voltage operation. They remain disabled and
-// at zero volts until a channel is selected.
+// DCOffset only sets each channel's drive mode during its initial setup. It does
+// not set range, waveform, offset, or Enabled here. Those properties are applied
+// later when a specific channel is selected.
 bool configureRelayOutputs(IVTEXFgenPtr fgen)
 {
     try
@@ -314,26 +337,22 @@ bool configureRelayOutputs(IVTEXFgenPtr fgen)
             const std::string name = fgenChannelName(channelNumber);
             _bstr_t channel(name.c_str());
 
-            fgen->Output->Enabled[channel] = VARIANT_FALSE;
             fgen->Output->DriveMode[channel] = VTEXFgenDriveModeVoltage;
-            fgen->Output->Range[channel] = RELAY_VOLTAGE;
-            fgen->Output->ChannelOutputMode[channel] =
-                VTEXFgenOutputModeFunction;
-            fgen->StandardWaveform->Waveform[channel] =
-                VTEXFgenWaveformDC;
-            fgen->StandardWaveform->DCOffset[channel] = 0.0;
         }
+
+        return true;
     }
     catch (const _com_error& error)
     {
         printComError("Configure relay outputs", error);
         return false;
     }
-
-    return allRelaysOff(fgen);
 }
 
-// Connect to the VTI chassis and prepare the Fgen card used for relay control.
+// Connect to the VTI chassis exactly the same way as the active initialization
+// call in DCOffset: identity query enabled, reset enabled, and an empty options
+// string. DCOffset builds a slot string, but its slot-specific call is commented
+// out, so we do not force a slot here either.
 bool initializeRelayFgen(IVTEXFgenPtr& fgen)
 {
     try
@@ -344,7 +363,7 @@ bool initializeRelayFgen(IVTEXFgenPtr& fgen)
             FGEN_RESOURCE,
             VARIANT_TRUE,
             VARIANT_TRUE,
-            FGEN_DRIVER_OPTIONS);
+            "");
 
         fgen = driver;
 
@@ -362,9 +381,10 @@ bool initializeRelayFgen(IVTEXFgenPtr& fgen)
     }
 }
 
-// Select one analog channel using break-before-make switching. All relay outputs
-// are removed first, the old pair is allowed to release, and only then is 24 V
-// applied to the requested channel's jumpered HIGH and LOW relay coils.
+// Select one analog channel using break-before-make switching. Current is already
+// in STBY before this function is called. All relay outputs are removed first,
+// the old pair is allowed to release, and then the requested channel is configured
+// in the same property order used by DCOffset.
 bool selectRelayChannel(IVTEXFgenPtr fgen, int channelNumber)
 {
     if (channelNumber < 1 || channelNumber > NUMBER_OF_TEST_CHANNELS)
@@ -384,6 +404,28 @@ bool selectRelayChannel(IVTEXFgenPtr fgen, int channelNumber)
     {
         const std::string name = fgenChannelName(channelNumber);
         _bstr_t channel(name.c_str());
+        const double magnitude = fabs(RELAY_VOLTAGE);
+
+        // Copy the range selection used by DCOffset. The comparisons are left
+        // exactly as DCOffset uses them so the working driver behavior is retained.
+        if (magnitude < 1.0)
+            fgen->Output->Range[channel] = 1.0;
+        else if (magnitude < 2.0)
+            fgen->Output->Range[channel] = 2.0;
+        else if (magnitude < 5.0)
+            fgen->Output->Range[channel] = 5.0;
+        else if (magnitude < 10.0)
+            fgen->Output->Range[channel] = 10.0;
+        else if (magnitude < 20.0)
+            fgen->Output->Range[channel] = 20.0;
+
+        // This order matches DCOffset: function output mode, DC waveform, DC
+        // offset, and finally Enabled to physically produce the output.
+        fgen->Output->ChannelOutputMode[channel] =
+            VTEXFgenOutputModeFunction;
+
+        fgen->StandardWaveform->Waveform[channel] =
+            VTEXFgenWaveformDC;
 
         fgen->StandardWaveform->DCOffset[channel] = RELAY_VOLTAGE;
         fgen->Output->Enabled[channel] = VARIANT_TRUE;
@@ -463,9 +505,9 @@ bool changeCurrentOutput(int microamps)
     return enableCurrentOutput(microamps);
 }
 
-// Change channels in the same safe order we discussed. Current is removed first,
-// the old relay pair is released, the new pair is selected, and then the current
-// is restored at the operator's existing setting.
+// Change channels in the safe order we discussed. Current is removed first, the
+// old relay pair is released, the new pair is selected using DCOffset's Fgen
+// sequence, and then the current is restored at the operator's existing setting.
 bool changeSelectedChannel(
     IVTEXFgenPtr fgen,
     int newChannel,
@@ -633,9 +675,9 @@ int main()
               << std::endl;
     printControls();
 
-    // Start in the safest, most predictable state: channel 1 at 1 uA. The same
-    // channel-change function used by the arrow keys is used here so startup and
-    // later switching follow exactly the same relay and current sequence.
+    // Start at channel 1 and 1 uA. The same channel-change function used by the
+    // arrow keys is used here so startup and later switching follow the exact same
+    // relay and current sequence.
     if (!changeSelectedChannel(
             relayFgen,
             selectedChannel,
